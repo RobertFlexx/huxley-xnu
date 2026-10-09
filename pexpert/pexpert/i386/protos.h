@@ -78,6 +78,8 @@ extern int  sprintf(char * str, const char * format, ...);
 int switch_to_serial_console(void);
 void switch_to_old_console(int);
 boolean_t console_is_serial(void);
+/* Bind readable bootstrap arguments before serial discovery or tree setup. */
+boolean_t PE_init_boot_args(void *args);
 int serial_init(void);
 void serial_putc(char);
 int serial_getc(void);

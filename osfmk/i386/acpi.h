@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2000 Apple Computer, Inc. All rights reserved.
+ * Modifications Copyright (c) 2026 Huxley contributors.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -48,6 +49,7 @@ extern vm_offset_t acpi_install_wake_handler(void);
 extern void        acpi_sleep_kernel(acpi_sleep_callback func, void * refcon);
 extern void        acpi_idle_kernel(acpi_sleep_callback func, void * refcon);
 void install_real_mode_bootstrap(void *prot_entry);
+/* Validated MADT type-0 local APIC count; zero for absent or malformed data. */
 extern uint32_t    acpi_count_enabled_logical_processors(void);
 #endif  /* ASSEMBLER */
 

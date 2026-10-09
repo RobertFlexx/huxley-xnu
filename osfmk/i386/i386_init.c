@@ -719,6 +719,9 @@ vstart(vm_offset_t boot_args_start)
 		 * Get startup parameters.
 		 */
 		kernelBootArgs = (boot_args *)boot_args_start;
+		if (!PE_init_boot_args(kernelBootArgs)) {
+			panic("Invalid bootstrap command line");
+		}
 		lphysfree = kernelBootArgs->kaddr + kernelBootArgs->ksize;
 		physfree = (void *)(uintptr_t)((lphysfree + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1));
 

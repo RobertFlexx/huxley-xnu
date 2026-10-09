@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2000-2020 Apple Inc. All rights reserved.
+ * Copyright (c) 2026 Huxley contributors.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -186,6 +187,7 @@
 #include <IOKit/IOKitKeys.h> /* kIODriverKitEntitlementKey */
 
 #include "kern_exec_internal.h"
+#include "huxley_init.h"
 
 #include <CodeSignature/Entitlements.h>
 
@@ -7263,10 +7265,20 @@ load_init_program_at_path(proc_t p, user_addr_t scratch_addr, const char* path)
 	assert(scratch_addr);
 	assert(path);
 
-	/*
-	 * Copy out program name.
-	 */
 	size_t path_length = strlen(path) + 1;
+	if (path_length > MAXPATHLEN) {
+		return ENAMETOOLONG;
+	}
+	size_t scratch_size = huxley_init_scratch_size(path_length,
+	    sizeof(user_addr_t), (boothowto & RB_SINGLE) != 0);
+	if (scratch_size == 0 || scratch_size > vm_map_page_size(current_map())) {
+		return E2BIG;
+	}
+	if (scratch_addr > (user_addr_t)-1 - scratch_size) {
+		return EFAULT;
+	}
+
+	/* Copy out only after the complete argument layout fits the mapping. */
 	argv0 = scratch_addr;
 	error = copyout(path, argv0, path_length);
 	if (error) {
@@ -7277,7 +7289,7 @@ load_init_program_at_path(proc_t p, user_addr_t scratch_addr, const char* path)
 
 	/*
 	 * Put out first (and only) argument, similarly.
-	 * Assumes everything fits in a page as allocated above.
+	 * The complete layout was bounded against the allocated page above.
 	 */
 	if (boothowto & RB_SINGLE) {
 		const char *init_args = "-s";
@@ -7364,6 +7376,12 @@ static const char * init_programs[] = {
  *		the kcsuffix boot-arg, setting launchdsuffix to "" or "release"
  *		will force /sbin/launchd to be selected.
  *
+ *              An explicit init_path boot argument selects one absolute path
+ *              in every build configuration. It takes precedence over launchd
+ *              selection and fails closed on an invalid path or exec failure.
+ *              The trusted boot environment owns this argument; the selected
+ *              executable follows the normal exec and security checks.
+ *
  *              Search order by build:
  *
  * DEBUG	DEVELOPMENT	RELEASE		PATH
@@ -7387,11 +7405,28 @@ load_init_program(proc_t p)
 	exec_log_handle = os_log_create("com.apple.xnu.bsd", "exec");
 #endif /* DEVELOPMENT || DEBUG */
 
-	(void) mach_vm_allocate_kernel(map, &scratch_addr, map_page_size,
+	kern_return_t allocation_result = mach_vm_allocate_kernel(map, &scratch_addr, map_page_size,
 	    VM_MAP_KERNEL_FLAGS_ANYWHERE());
+	if (allocation_result != KERN_SUCCESS) {
+		panic("Process 1 scratch allocation failed, kern_return_t %d", allocation_result);
+	}
 #if CONFIG_MEMORYSTATUS
 	(void) memorystatus_init_at_boot_snapshot();
 #endif /* CONFIG_MEMORYSTATUS */
+
+	char init_path[MAXPATHLEN + 1];
+	huxley_init_path_policy init_policy = huxley_init_path_select(init_path, sizeof(init_path));
+	if (init_policy == HUXLEY_INIT_PATH_INVALID) {
+		panic("Invalid or truncated init_path boot argument");
+	}
+	if (init_policy == HUXLEY_INIT_PATH_OVERRIDE) {
+		printf("load_init_program: attempting to load %s\n", init_path);
+		error = load_init_program_at_path(p, (user_addr_t)scratch_addr, init_path);
+		if (!error) {
+			return;
+		}
+		panic("Process 1 exec of init_path %s failed, errno %d", init_path, error);
+	}
 
 #if DEBUG || DEVELOPMENT
 	/* Check for boot-arg suffix first */

@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2016 Apple Inc. All rights reserved.
+ * Modifications Copyright (c) 2026 Huxley contributors.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -42,6 +43,7 @@
 #include <libkern/libkern.h>
 #include <pexpert/i386/efi.h>
 #include <pexpert/i386/boot.h>
+#include <pexpert/i386/efi_memory_map.h>
 #include <sys/queue.h>
 #include "kasan.h"
 #include "kasan_internal.h"
@@ -287,7 +289,22 @@ kasan_reserve_memory(void *_args)
 	unsigned long total_pages;
 	unsigned long to_steal;
 
+	/* This map is consumed before i386_vm_init() can validate it. */
+	PE_efi_memory_map_status map_status = PE_efi_memory_map_validate_metadata(
+		args->MemoryMap, args->MemoryMapSize,
+		args->MemoryMapDescriptorSize, args->MemoryMapDescriptorVersion);
+	if (map_status != PE_EFI_MEMORY_MAP_VALID) {
+		panic("KASAN: invalid EFI memory map metadata: status %u", (unsigned)map_status);
+	}
 	mptr = (EfiMemoryRange *)ml_static_ptovirt((vm_offset_t)args->MemoryMap);
+	uint32_t bad_descriptor = 0;
+	map_status = PE_efi_memory_map_validate_ranges(mptr,
+		args->MemoryMapSize, args->MemoryMapDescriptorSize,
+		VM_MIN_KERNEL_ADDRESS, INTEL_PTE_PFN, &bad_descriptor);
+	if (map_status != PE_EFI_MEMORY_MAP_VALID) {
+		panic("KASAN: invalid EFI memory map descriptor %u: status %u",
+		    bad_descriptor, (unsigned)map_status);
+	}
 	msize = args->MemoryMapDescriptorSize;
 	mcount = args->MemoryMapSize / msize;
 
@@ -305,7 +322,9 @@ kasan_reserve_memory(void *_args)
 		base = (ppnum_t)(mptr_tmp->PhysicalStart >> I386_PGSHIFT);
 		top = (ppnum_t)((mptr_tmp->PhysicalStart >> I386_PGSHIFT) + mptr_tmp->NumberOfPages - 1);
 
-		if ((mptr_tmp->Type == kEfiConventionalMemory) && (mptr_tmp->NumberOfPages > to_steal)) {
+		if ((mptr_tmp->Type == kEfiConventionalMemory) &&
+		    (mptr_tmp->Attribute & EFI_MEMORY_RUNTIME) == 0 &&
+		    (mptr_tmp->NumberOfPages > to_steal)) {
 			/* Found a region with sufficient space - steal from the end */
 			mptr_tmp->NumberOfPages -= to_steal;
 

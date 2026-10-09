@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2000-2006 Apple Computer, Inc. All rights reserved.
+ * Modifications Copyright (c) 2026 Huxley contributors.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -593,15 +594,25 @@ int
 serial_init( void )
 {
 	unsigned new_uart_baud_rate = 0;
+	unsigned legacy_uart_only = 0;
 
 	if (PE_parse_boot_argn("serialbaud", &new_uart_baud_rate, sizeof(new_uart_baud_rate))) {
 		/* Valid divisor? */
-		if (!((LEGACY_UART_CLOCK / 16) % new_uart_baud_rate)) {
+		if (new_uart_baud_rate != 0 &&
+		    (LEGACY_UART_CLOCK / 16) % new_uart_baud_rate == 0 &&
+		    (LEGACY_UART_CLOCK / 16) / new_uart_baud_rate <= 0xffff) {
 			uart_baud_rate = new_uart_baud_rate;
 		}
 	}
 
-	if (mmio_uart_probe()) {
+	/*
+	 * Generic PCs may not decode the platform-specific MMIO addresses.
+	 * An explicit legacy selection must not probe or fall back to them.
+	 * The COM1 scratch-register probe still verifies device presence.
+	 */
+	PE_parse_boot_argn("legacy_uart", &legacy_uart_only, sizeof(legacy_uart_only));
+
+	if (!legacy_uart_only && mmio_uart_probe()) {
 		gPESF = &mmio_uart_serial_functions;
 		gPESF->uart_init();
 		lpss_uart_supported = 1;
@@ -612,7 +623,7 @@ serial_init( void )
 		gPESF->uart_init();
 		legacy_uart_enabled = 1;
 		return 1;
-	} else if (pcie_mmio_uart_probe()) {
+	} else if (!legacy_uart_only && pcie_mmio_uart_probe()) {
 		gPESF = &pcie_mmio_uart_serial_functions;
 		gPESF->uart_init();
 		pcie_uart_enabled = 1;

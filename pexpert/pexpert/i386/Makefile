@@ -9,6 +9,8 @@ include $(MakeInc_def)
 DATAFILES = \
         boot.h \
         efi.h \
+	efi_memory_map.h \
+	efi_tables.h \
 	protos.h
 
 INSTALL_MD_LIST	= ${DATAFILES}

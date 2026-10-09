@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2000-2021 Apple Inc. All rights reserved.
+ * Modifications Copyright (c) 2026 Huxley contributors.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -64,6 +65,7 @@
 #include <acpi/Acpi.h>
 #include <acpi/Acpi_v1.h>
 #include <pexpert/i386/efi.h>
+#include <pexpert/i386/acpi_validate.h>
 
 #include <kern/cpu_data.h>
 #include <kern/machine.h>
@@ -558,200 +560,107 @@ ml_recent_wake(void)
 	return (ctime - acpi_wake_postrebase_abstime) < 5 * NSEC_PER_SEC;
 }
 
-static uint8_t
-cksum8(uint8_t *ptr, uint32_t size)
-{
-	uint8_t sum = 0;
-	uint32_t i;
-
-	for (i = 0; i < size; i++) {
-		sum += ptr[i];
-	}
-
-	return sum;
-}
+/* Freeze the inherited table prefixes used by the bounded wire reader. */
+_Static_assert(sizeof(ACPI_TABLE_HEADER) == PE_ACPI_HEADER_SIZE, "ACPI header layout");
+_Static_assert(sizeof(RSDP_DESCRIPTOR) == PE_ACPI_RSDP_V2_SIZE, "RSDP layout");
+_Static_assert(sizeof(MULTIPLE_APIC_TABLE) == PE_ACPI_MADT_SIZE, "MADT layout");
+_Static_assert(sizeof(MADT_PROCESSOR_APIC) == 8, "Local APIC record layout");
 
 /*
- * Parameterized search for a specified table given an sdtp (either RSDT or XSDT).
- * Note that efiboot does not modify the addresses of tables in the RSDT or XSDT
- * TableOffsetEntry array, so we do not need to "convert" from efiboot virtual to
- * physical.
+ * Discovery runs before i386_vm_init. Bounds here describe the existing
+ * physical aperture, not proof that firmware has supplied readable RAM.
+ * Never pass an unchecked address or an out-of-aperture table to PHYSMAP_PTOV.
  */
-#define SEARCH_FOR_ACPI_TABLE(sdtp, signature, entry_type) \
-{                                                                                               \
-	uint32_t i, pointer_count;                                                              \
-                                                                                                \
-	/* Walk the list of tables in the *SDT, looking for the signature passed in */          \
-	pointer_count = ((sdtp)->Length - sizeof(ACPI_TABLE_HEADER)) / sizeof(entry_type);      \
-                                                                                                \
-	for (i = 0; i < pointer_count; i++) {                                                   \
-	        ACPI_TABLE_HEADER *next_table =                                                 \
-	                (ACPI_TABLE_HEADER *)PHYSMAP_PTOV(                                      \
-	                        (uintptr_t)(sdtp)->TableOffsetEntry[i]);                        \
-	        if (strncmp(&next_table->Signature[0], (signature), 4) == 0) {                  \
-	/* \
-	 * Checksum the table first, then return it if the checksum \
-	 * is valid. \
-	 */                                                                                     \
-	                if (cksum8((uint8_t *)next_table, next_table->Length) == 0) {           \
-	                        return next_table;                                              \
-	                } else {                                                                \
-	                        DBG("Invalid checksum for table [%s]@0x%lx!\n", (signature),    \
-	                            (unsigned long)(sdtp)->TableOffsetEntry[i]);                \
-	                        return NULL;                                                    \
-	                }                                                                       \
-	        }                                                                               \
-	}                                                                                       \
-                                                                                                \
-	return NULL;                                                                            \
-}
-
-static ACPI_TABLE_HEADER *
-acpi_find_table_via_xsdt(XSDT_DESCRIPTOR *xsdtp, const char *signature)
+static const void *
+acpi_map_firmware(uint64_t address, uint32_t minimum_size, uint32_t *readable_size)
 {
-	SEARCH_FOR_ACPI_TABLE(xsdtp, signature, UINT64);
-}
-
-static ACPI_TABLE_HEADER *
-acpi_find_table_via_rsdt(RSDT_DESCRIPTOR *rsdtp, const char *signature)
-{
-	SEARCH_FOR_ACPI_TABLE(rsdtp, signature, UINT32);
+	*readable_size = 0;
+	if (address == 0 || physmap_max <= physmap_base) {
+		return NULL;
+	}
+	uint64_t capacity = physmap_max - physmap_base;
+	if (address >= capacity || capacity - address < minimum_size) {
+		return NULL;
+	}
+	uint64_t remaining = capacity - address;
+	if (remaining > PE_ACPI_MAX_TABLE_SIZE) {
+		remaining = PE_ACPI_MAX_TABLE_SIZE;
+	}
+	*readable_size = (uint32_t)remaining;
+	return PHYSMAP_PTOV((uintptr_t)address);
 }
 
 /*
- * Returns a pointer to an ACPI table header corresponding to the table
- * whose signature is passed in, or NULL if no such table could be found.
+ * Locate a checksummed table through the existing EFI-provided RSDP.
+ * Firmware physical addresses remain physical; no loader virtual conversion
+ * is applied to root entries. A malformed root or matching table fails closed.
  */
 static ACPI_TABLE_HEADER *
 acpi_find_table(uintptr_t rsdp_physaddr, const char *signature)
 {
-	static RSDP_DESCRIPTOR *rsdp = NULL;
-	static XSDT_DESCRIPTOR *xsdtp = NULL;
-	static RSDT_DESCRIPTOR *rsdtp = NULL;
+	uint32_t readable_size;
+	uint64_t root_address;
+	uint8_t entry_width;
+	uint32_t entry_count;
+	uint32_t table_length;
+	PE_acpi_status status;
 
 	if (signature == NULL) {
-		DBG("Invalid NULL signature passed to acpi_find_table\n");
+		return NULL;
+	}
+	const void *rsdp = acpi_map_firmware(rsdp_physaddr,
+	    PE_ACPI_RSDP_V1_SIZE, &readable_size);
+	status = PE_acpi_validate_rsdp(rsdp, readable_size, &root_address, &entry_width);
+	if (status != PE_ACPI_VALID) {
+		DBG("Invalid ACPI RSDP at 0x%lx: status %u\n",
+		    (unsigned long)rsdp_physaddr, (unsigned)status);
 		return NULL;
 	}
 
-	/*
-	 * RSDT or XSDT is required; without it, we cannot locate other tables.
-	 */
-	if (__improbable(rsdp == NULL || (rsdtp == NULL && xsdtp == NULL))) {
-		rsdp = PHYSMAP_PTOV(rsdp_physaddr);
-
-		/* Verify RSDP signature */
-		if (__improbable(strncmp((void *)rsdp, "RSD PTR ", 8) != 0)) {
-			DBG("RSDP signature mismatch: Aborting acpi_find_table\n");
-			rsdp = NULL;
-			return NULL;
-		}
-
-		/* Verify RSDP checksum */
-		if (__improbable(cksum8((uint8_t *)rsdp, sizeof(RSDP_DESCRIPTOR)) != 0)) {
-			DBG("RSDP@0x%lx signature mismatch: Aborting acpi_find_table\n",
-			    (unsigned long)rsdp_physaddr);
-			rsdp = NULL;
-			return NULL;
-		}
-
-		/* Ensure the revision of the RSDP indicates the presence of an RSDT or XSDT */
-		if (__improbable(rsdp->Revision >= RSDP_VERSION_ACPI20 && rsdp->XsdtPhysicalAddress == 0ULL)) {
-			DBG("RSDP XSDT Physical Address is 0!: Aborting acpi_find_table\n");
-			rsdp = NULL;
-			return NULL;
-		} else if (__probable(rsdp->Revision >= RSDP_VERSION_ACPI20)) {
-			/* XSDT (with 64-bit pointers to tables) */
-			rsdtp = NULL;
-			xsdtp = PHYSMAP_PTOV(rsdp->XsdtPhysicalAddress);
-			if (cksum8((uint8_t *)xsdtp, xsdtp->Length) != 0) {
-				DBG("ERROR: XSDT@0x%lx checksum is non-zero; not using this XSDT\n",
-				    (unsigned long)rsdp->XsdtPhysicalAddress);
-				xsdtp = NULL;
-				return NULL;
-			}
-		} else if (__improbable(rsdp->Revision == RSDP_VERSION_ACPI10 && rsdp->RsdtPhysicalAddress == 0)) {
-			DBG("RSDP RSDT Physical Address is 0!: Aborting acpi_find_table\n");
-			rsdp = NULL;
-			return NULL;
-		} else if (__improbable(rsdp->Revision == RSDP_VERSION_ACPI10)) {
-			/* RSDT (with 32-bit pointers to tables) */
-			xsdtp = NULL;
-			rsdtp = PHYSMAP_PTOV((uintptr_t)rsdp->RsdtPhysicalAddress);
-			if (cksum8((uint8_t *)rsdtp, rsdtp->Length) != 0) {
-				DBG("ERROR: RSDT@0x%lx checksum is non-zero; not using this RSDT\n",
-				    (unsigned long)rsdp->RsdtPhysicalAddress);
-				rsdtp = NULL;
-				return NULL;
-			}
-		} else {
-			DBG("Unrecognized RSDP Revision (0x%x): Aborting acpi_find_table\n",
-			    rsdp->Revision);
-			rsdp = NULL;
-			return NULL;
-		}
+	const void *root = acpi_map_firmware(root_address,
+	    PE_ACPI_HEADER_SIZE, &readable_size);
+	status = PE_acpi_validate_root(root, readable_size, entry_width, &entry_count);
+	if (status != PE_ACPI_VALID) {
+		DBG("Invalid ACPI root at 0x%llx: status %u\n", root_address, (unsigned)status);
+		return NULL;
 	}
 
-	assert(xsdtp != NULL || rsdtp != NULL);
-
-	if (__probable(xsdtp != NULL)) {
-		return acpi_find_table_via_xsdt(xsdtp, signature);
-	} else if (rsdtp != NULL) {
-		return acpi_find_table_via_rsdt(rsdtp, signature);
+	for (uint32_t i = 0; i < entry_count; i++) {
+		uint64_t table_address = PE_acpi_root_entry(root, i, entry_width);
+		const void *table = acpi_map_firmware(table_address,
+		    PE_ACPI_HEADER_SIZE, &readable_size);
+		status = PE_acpi_validate_sdt(table, readable_size, signature, &table_length);
+		if (status == PE_ACPI_BAD_SIGNATURE) {
+			continue;
+		}
+		if (status != PE_ACPI_VALID) {
+			DBG("Invalid ACPI table at 0x%llx: status %u\n", table_address, (unsigned)status);
+			return NULL;
+		}
+		return (ACPI_TABLE_HEADER *)table;
 	}
-
 	return NULL;
 }
 
-/*
- * Returns the count of enabled logical processors present in the ACPI
- * MADT, or 0 if the MADT could not be located.
- */
+/* Returns zero for absent or malformed MADT data; no partial count escapes. */
 uint32_t
 acpi_count_enabled_logical_processors(void)
 {
-	MULTIPLE_APIC_TABLE *madtp;
-	void *end_ptr;
-	APIC_HEADER *next_apic_entryp;
-	uint32_t enabled_cpu_count = 0;
-	uint64_t rsdp_physaddr;
-
-	rsdp_physaddr = efi_get_rsdp_physaddr();
-	if (__improbable(rsdp_physaddr == 0)) {
-		DBG("acpi_count_enabled_logical_processors: Could not get RSDP physaddr from EFI.\n");
+	uint64_t rsdp_physaddr = efi_get_rsdp_physaddr();
+	if (rsdp_physaddr == 0) {
 		return 0;
 	}
-
-	madtp = (MULTIPLE_APIC_TABLE *)acpi_find_table(rsdp_physaddr, ACPI_SIG_MADT);
-
-	if (__improbable(madtp == NULL)) {
-		DBG("acpi_count_enabled_logical_processors: Could not find the MADT.\n");
+	ACPI_TABLE_HEADER *madt = acpi_find_table(rsdp_physaddr, ACPI_SIG_MADT);
+	if (madt == NULL) {
 		return 0;
 	}
-
-	end_ptr = (void *)((uintptr_t)madtp + madtp->Length);
-	next_apic_entryp = (APIC_HEADER *)((uintptr_t)madtp + sizeof(MULTIPLE_APIC_TABLE));
-
-	while ((void *)next_apic_entryp < end_ptr) {
-		switch (next_apic_entryp->Type) {
-		case APIC_PROCESSOR:
-		{
-			MADT_PROCESSOR_APIC *madt_procp = (MADT_PROCESSOR_APIC *)next_apic_entryp;
-			if (madt_procp->ProcessorEnabled) {
-				enabled_cpu_count++;
-			}
-
-			break;
-		}
-
-		default:
-			DBG("Ignoring MADT entry type 0x%x length 0x%x\n", next_apic_entryp->Type,
-			    next_apic_entryp->Length);
-			break;
-		}
-
-		next_apic_entryp = (APIC_HEADER *)((uintptr_t)next_apic_entryp + next_apic_entryp->Length);
+	uint32_t enabled_cpu_count;
+	uint32_t bad_offset;
+	PE_acpi_status status = PE_acpi_count_enabled_cpus(madt, madt->Length,
+	    &enabled_cpu_count, &bad_offset);
+	if (status != PE_ACPI_VALID) {
+		DBG("Invalid ACPI MADT: status %u offset %u\n", (unsigned)status, bad_offset);
+		return 0;
 	}
-
 	return enabled_cpu_count;
 }

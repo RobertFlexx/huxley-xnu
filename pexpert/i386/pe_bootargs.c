@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2000 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 2026 Huxley contributors.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -28,9 +29,35 @@
 #include <pexpert/pexpert.h>
 #include <pexpert/boot.h>
 
+/*
+ * vstart uses the bootstrap identity mapping before PE_init_platform establishes
+ * the final boot-argument mapping and device tree. Only bind the command-line
+ * source here; leave all other platform state for PE_init_platform.
+ */
+boolean_t
+PE_init_boot_args(void *args)
+{
+	boot_args *boot_args_ptr = (boot_args *)args;
+
+	if (boot_args_ptr == 0) {
+		return FALSE;
+	}
+	for (unsigned int i = 0; i < sizeof(boot_args_ptr->CommandLine); i++) {
+		if (boot_args_ptr->CommandLine[i] == '\0') {
+			PE_state.bootArgs = args;
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
 char *
 PE_boot_args(
 	void)
 {
+	/* Early validation failures must not make diagnostic parsing read page zero. */
+	if (PE_state.bootArgs == 0) {
+		return "";
+	}
 	return ((boot_args *)PE_state.bootArgs)->CommandLine;
 }

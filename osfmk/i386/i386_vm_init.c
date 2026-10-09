@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2003-2019 Apple Inc. All rights reserved.
+ * Modifications Copyright (c) 2026 Huxley contributors.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -76,6 +77,7 @@
 #include <i386/cpuid.h>
 #include <mach/thread_status.h>
 #include <pexpert/i386/efi.h>
+#include <pexpert/i386/efi_memory_map.h>
 #include <pexpert/pexpert.h>
 #include <i386/i386_lowmem.h>
 #include <i386/misc_protos.h>
@@ -445,11 +447,23 @@ i386_vm_init(uint64_t   maxmem,
 	pmap_memory_region_count = pmap_memory_region_current = 0;
 	fap = (ppnum_t) i386_btop(first_avail);
 
-	maddr = ml_static_ptovirt((vm_offset_t)args->MemoryMap);
-	mptr = (EfiMemoryRange *)maddr;
-	if (args->MemoryMapDescriptorSize == 0) {
-		panic("Invalid memory map descriptor size");
+	/* Validate the loader-owned map before its ranges enter PMAP. */
+	PE_efi_memory_map_status map_status = PE_efi_memory_map_validate_metadata(
+		args->MemoryMap, args->MemoryMapSize,
+		args->MemoryMapDescriptorSize, args->MemoryMapDescriptorVersion);
+	if (map_status != PE_EFI_MEMORY_MAP_VALID) {
+		panic("Invalid EFI memory map metadata: status %u", (unsigned)map_status);
 	}
+	maddr = ml_static_ptovirt((vm_offset_t)args->MemoryMap);
+	uint32_t bad_descriptor = 0;
+	map_status = PE_efi_memory_map_validate_ranges((const void *)maddr,
+		args->MemoryMapSize, args->MemoryMapDescriptorSize,
+		VM_MIN_KERNEL_ADDRESS, INTEL_PTE_PFN, &bad_descriptor);
+	if (map_status != PE_EFI_MEMORY_MAP_VALID) {
+		panic("Invalid EFI memory map descriptor %u: status %u",
+		    bad_descriptor, (unsigned)map_status);
+	}
+	mptr = (EfiMemoryRange *)maddr;
 	msize = args->MemoryMapDescriptorSize;
 	mcount = args->MemoryMapSize / msize;
 
@@ -631,12 +645,15 @@ i386_vm_init(uint64_t   maxmem,
 				}
 				pmptr->type = pmap_type;
 				pmptr->attribute = mptr->Attribute;
-			} else if ((base < fap) && (top > fap)) {
+			} else if ((base < fap) && (top >= fap)) {
 				/*
 				 * spans first_avail
 				 * put mem below first avail in table but
 				 * mark already allocated
 				 */
+				if (pmap_memory_region_count >= PMAP_MEMORY_REGIONS_SIZE - 1) {
+					panic("Insufficient PMAP memory regions for EFI descriptor %u split", i);
+				}
 				pmptr->base = base;
 				pmptr->end = (fap - 1);
 				pmptr->alloc_up = pmptr->end + 1;

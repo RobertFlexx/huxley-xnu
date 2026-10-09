@@ -1,0 +1,5 @@
+# Inherited kernel build products and Huxley diagnostics/test artifacts.
+/BUILD/
+
+# Python bytecode from developer tooling.
+/tools/huxley/__pycache__/

@@ -1,0 +1,50 @@
+name: Huxley platform contracts
+on:
+  push:
+    paths:
+      - '.github/workflows/huxley-platform.yml'
+      - 'tools/huxley/**'
+      - 'tests/huxley/**'
+      - 'pexpert/pexpert/i386/**'
+      - 'pexpert/i386/pe_serial.c'
+      - 'pexpert/i386/pe_bootargs.c'
+      - 'pexpert/gen/bootargs.c'
+      - 'osfmk/i386/i386_init.c'
+      - 'osfmk/i386/i386_vm_init.c'
+      - 'san/memory/kasan-x86_64.c'
+  pull_request:
+    paths:
+      - '.github/workflows/huxley-platform.yml'
+      - 'tools/huxley/**'
+      - 'tests/huxley/**'
+      - 'pexpert/pexpert/i386/**'
+      - 'pexpert/i386/pe_serial.c'
+      - 'pexpert/i386/pe_bootargs.c'
+      - 'pexpert/gen/bootargs.c'
+      - 'osfmk/i386/i386_init.c'
+      - 'osfmk/i386/i386_vm_init.c'
+      - 'san/memory/kasan-x86_64.c'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  platform:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install public test tools
+        run: sudo apt-get update && sudo apt-get install -y clang llvm lld gcc qemu-system-x86 ovmf
+      - name: Record environment (upstream SDK build remains blocked on Linux)
+        continue-on-error: true
+        run: python3 tools/huxley/hxnu.py doctor
+      - name: Execute platform regression tests
+        run: python3 tools/huxley/hxnu.py test
+      - name: Execute real firmware and serial tests in QEMU
+        run: python3 tools/huxley/hxnu.py firmware-test --cycles 3
+      - name: Retain commands, results, objects and serial logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hxnu-platform-validation
+          path: BUILD/huxley/
